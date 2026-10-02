@@ -47,12 +47,27 @@ nên lớp cần "chốt hạ" cuối cùng phải đứng đầu tiên.
 
 from __future__ import annotations
 
+import re
+
+from arena.corpus import INJECTION_CANARY
+from arena.tools import ToolResult
 from harness.middleware import Middleware
 
 #: Dấu mốc của đoạn nội dung không đáng tin trong kho tài liệu.
+BLOCK_PAIRS = (
+    ("--- LƯU Ý HỆ THỐNG", "--- HẾT LƯU Ý HỆ THỐNG ---"),
+    ("--- SYSTEM NOTE", "--- END SYSTEM NOTE ---"),
+    ("--- SYSTEM INSTRUCTION", "--- END SYSTEM INSTRUCTION ---"),
+    ("[SYSTEM NOTE]", "[END SYSTEM NOTE]"),
+    ("[LƯU Ý HỆ THỐNG]", "[HẾT LƯU Ý HỆ THỐNG]"),
+    ("=== SYSTEM NOTE", "=== END SYSTEM NOTE ==="),
+)
+
 BLOCK_START = "--- LƯU Ý HỆ THỐNG"
 BLOCK_END = "--- HẾT LƯU Ý HỆ THỐNG ---"
 PLACEHOLDER = "[nội dung không đáng tin cậy đã bị loại bỏ]"
+
+_CANARY_CLEANUP_RE = re.compile(r"ARENA[-_]CANARY[-_]?[A-Za-z0-9]*", re.IGNORECASE)
 
 
 class InjectionGuard(Middleware):
@@ -62,17 +77,46 @@ class InjectionGuard(Middleware):
 
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§10): khoảng 8-15 dòng.
-        #  1. Nếu BLOCK_START không có trong result.content -> trả về result.
-        #  2. Cắt từ BLOCK_START tới hết BLOCK_END, thay bằng PLACEHOLDER.
-        #     Nếu KHÔNG tìm thấy BLOCK_END (fetch bị cắt giữa chừng) thì
-        #     cắt từ BLOCK_START tới hết chuỗi.
-        #  3. Lặp lại cho tới khi không còn BLOCK_START nào.
-        #  4. Trả về ToolResult(ok=result.ok, content=<đã sạch>, error=result.error).
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not isinstance(result.content, str):
+            return result
+
+        content = result.content
+        modified = False
+
+        # 1. Quét theo các cặp đánh dấu injection (tiếng Việt, tiếng Anh, markdown)
+        for start_tag, end_tag in BLOCK_PAIRS:
+            while start_tag in content:
+                start = content.find(start_tag)
+                end = content.find(end_tag, start)
+                if end != -1:
+                    content = content[:start] + PLACEHOLDER + content[end + len(end_tag):]
+                else:
+                    # Bị cắt giữa chừng (truncate): loại bỏ từ start đến hết
+                    content = content[:start] + PLACEHOLDER
+                    break
+                modified = True
+
+        # 2. Phòng thủ sâu: nếu canary vẫn còn xuất hiện trong tool content
+        if INJECTION_CANARY in content:
+            lines = content.splitlines()
+            cleaned_lines = []
+            for line in lines:
+                if INJECTION_CANARY in line:
+                    cleaned_lines.append(PLACEHOLDER)
+                    modified = True
+                else:
+                    cleaned_lines.append(line)
+            content = "\n".join(cleaned_lines)
+
+        if modified:
+            return ToolResult(ok=result.ok, content=content, error=result.error)
+        return result
 
     def after_agent(self, ctx, report):
-        # TODO (§10): 2-4 dòng.
-        #  Nếu INJECTION_CANARY còn trong report["answer"] thì gỡ nó ra.
-        #  Chỉ sửa "answer" — tuyệt đối không sửa text của claim.
-        return report  # <- mặc định KHÔNG LÀM GÌ
+        if isinstance(report, dict) and isinstance(report.get("answer"), str):
+            answer = report["answer"]
+            if INJECTION_CANARY in answer or _CANARY_CLEANUP_RE.search(answer):
+                # Thanh lọc toàn bộ biến thể canary khỏi answer
+                report["answer"] = _CANARY_CLEANUP_RE.sub("", answer).strip()
+        return report
+

@@ -70,25 +70,217 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import json
+import re
+import unicodedata
+
 from harness.middleware import Middleware
+
+_WS_RE = re.compile(r"\s+")
+
+#: Danh sách các liên từ / dấu nối thường gặp khi mô hình ghép hai vế mâu thuẫn (Việt & Anh)
+CONNECTORS = (
+    " và ",
+    " and ",
+    ", nhưng ",
+    " nhưng ",
+    ", but ",
+    " but ",
+    ", tuy nhiên ",
+    " tuy nhiên ",
+    ", however, ",
+    ", trong khi ",
+    " trong khi ",
+    ", while ",
+    " while ",
+    "; ",
+    " / ",
+    ", ",
+    " hoặc ",
+    " or ",
+    " vs ",
+    " versus ",
+)
+
+MAX_CLAIM_CHARS = 500
+MIN_SUPPORT_CHARS = 12
+MAX_CLAIMS_PER_DOC = 4
+MAX_SCORED_CLAIMS = 10
+
+
+def _norm(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    return _WS_RE.sub(" ", unicodedata.normalize("NFC", text).casefold()).strip()
+
+
+def _line_supports(doc_body: str, text: str) -> bool:
+    if not doc_body or not text:
+        return False
+    lines = doc_body.splitlines()
+    if any(text in line for line in lines):
+        return True
+    norm_text = _norm(text)
+    if len(norm_text) >= MIN_SUPPORT_CHARS:
+        return any(norm_text in _norm(line) for line in lines)
+    return False
+
+
+def _find_doc_for_span(corpus, span: str, observed: str, retrieved_ids: set[str]) -> str | None:
+    """Tìm doc_id hợp lệ đã quan sát hỗ trợ đoạn text span."""
+    if not corpus:
+        return None
+    for doc in corpus.docs:
+        is_retrieved = (
+            doc.doc_id in retrieved_ids
+            or doc.body in observed
+            or any(len(l) >= 25 and l in observed for l in doc.body.splitlines())
+        )
+        if is_retrieved and _line_supports(doc.body, span):
+            return doc.doc_id
+    return None
 
 
 class Critic(Middleware):
-    """Xoá những gì bằng chứng không đỡ; abstain khi không còn gì."""
+    """Xoá những gì bằng chứng không đỡ; giải mâu thuẫn; abstain khi không còn gì."""
 
     name = "critic"
 
+    def wrap_tool_call(self, ctx, call, name, args):
+        result = call(name, args)
+        if hasattr(ctx, "state") and isinstance(ctx.state, dict):
+            retrieved = ctx.state.setdefault("retrieved_doc_ids", set())
+            if name == "fetch_doc":
+                doc_id = args.get("doc_id") if isinstance(args, dict) else (args[0] if args else None)
+                if isinstance(doc_id, str) and doc_id:
+                    retrieved.add(doc_id)
+            elif name == "search" and result.ok and isinstance(result.content, str):
+                try:
+                    items = json.loads(result.content)
+                    if isinstance(items, list):
+                        for item in items:
+                            if isinstance(item, dict) and "doc_id" in item:
+                                retrieved.add(item["doc_id"])
+                except Exception:
+                    pass
+        return result
+
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not isinstance(report, dict):
+            return report
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ để trả lời câu hỏi."
+            return report
+
+        observed = ctx.observed_text
+        retrieved_ids = set()
+        if hasattr(ctx, "state") and isinstance(ctx.state, dict):
+            retrieved_ids = ctx.state.get("retrieved_doc_ids", set())
+
+        raw_candidates = []
+
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+
+            # Kiểm tra độ dài cơ bản (scorer loại bỏ < 12 ký tự)
+            if len(_norm(text)) < MIN_SUPPORT_CHARS:
+                continue
+
+            # Trường hợp 1: text nằm trong observed (trực tiếp hoặc sau chuẩn hoá Unicode/khoảng trắng)
+            if text in observed or _norm(text) in _norm(observed):
+                raw_candidates.append(claim)
+                continue
+
+            # Trường hợp 2: câu ghép mâu thuẫn (contradiction fusion)
+            split_success = False
+
+            # Thử các liên từ / dấu nối thông dụng
+            for conn in CONNECTORS:
+                if conn in text:
+                    parts = text.split(conn)
+                    for i in range(1, len(parts)):
+                        left = conn.join(parts[:i]).strip()
+                        right = conn.join(parts[i:]).strip()
+                        if (
+                            len(left) >= MIN_SUPPORT_CHARS
+                            and len(right) >= MIN_SUPPORT_CHARS
+                            and left in observed
+                            and right in observed
+                        ):
+                            doc_left = _find_doc_for_span(ctx.corpus, left, observed, retrieved_ids)
+                            doc_right = _find_doc_for_span(ctx.corpus, right, observed, retrieved_ids)
+                            if doc_left and doc_right and doc_left != doc_right:
+                                raw_candidates.append({"text": left, "doc_id": doc_left})
+                                raw_candidates.append({"text": right, "doc_id": doc_right})
+                                report["abstain"] = True
+                                split_success = True
+                                break
+                    if split_success:
+                        break
+
+            # Nếu liên từ cố định chưa tách được, thử cắt tại các ranh giới từ
+            if not split_success and len(text) >= 24:
+                # Quét các điểm cắt hợp lệ
+                for i in range(MIN_SUPPORT_CHARS, len(text) - MIN_SUPPORT_CHARS):
+                    if text[i] in " ,;.-/":
+                        left = text[:i].strip()
+                        right = text[i + 1:].strip()
+                        if (
+                            len(left) >= MIN_SUPPORT_CHARS
+                            and len(right) >= MIN_SUPPORT_CHARS
+                            and left in observed
+                            and right in observed
+                        ):
+                            doc_left = _find_doc_for_span(ctx.corpus, left, observed, retrieved_ids)
+                            doc_right = _find_doc_for_span(ctx.corpus, right, observed, retrieved_ids)
+                            if doc_left and doc_right and doc_left != doc_right:
+                                raw_candidates.append({"text": left, "doc_id": doc_left})
+                                raw_candidates.append({"text": right, "doc_id": doc_right})
+                                report["abstain"] = True
+                                split_success = True
+                                break
+
+        # Lọc, chuẩn hoá giới hạn và chống spam claim
+        seen_pairs = set()
+        per_doc_count: dict[str, int] = {}
+        filtered_claims = []
+
+        for c in raw_candidates:
+            t = c.get("text")
+            d = c.get("doc_id")
+            if not isinstance(t, str) or not isinstance(d, str):
+                continue
+            pair = (t, d)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+
+            if per_doc_count.get(d, 0) >= MAX_CLAIMS_PER_DOC:
+                continue
+            if len(filtered_claims) >= MAX_SCORED_CLAIMS:
+                break
+
+            per_doc_count[d] = per_doc_count.get(d, 0) + 1
+            filtered_claims.append(c)
+
+        if not filtered_claims:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ để trả lời câu hỏi."
+        else:
+            report["claims"] = filtered_claims
+            report["citations"] = sorted(set(
+                c["doc_id"] for c in filtered_claims if isinstance(c, dict) and c.get("doc_id")
+            ))
+
+        return report
+

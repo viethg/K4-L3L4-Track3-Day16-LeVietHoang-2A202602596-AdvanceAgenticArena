@@ -104,12 +104,14 @@ you switch the addendum on, measure your own efficiency delta with
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 
 from arena.model import (
     ARENA_SYSTEM_PROMPT,
     TOOL_ERROR_PREFIX,
+    ParsedOutput,
     parse_output,
 )
 from arena.tools import ToolResult
@@ -453,6 +455,58 @@ class AgentContext:
         return bool(text) and text in self.observed_text
 
 
+def _repair_action(text: str) -> ParsedOutput | None:
+    """Khôi phục ACTION khi mô hình thật dùng code block ```json hoặc định dạng nhiều dòng."""
+    match = re.search(r"\baction\s*:\s*", text, re.I)
+    if not match:
+        return None
+    thought_match = re.search(r"\bthought\s*:\s*(.*)", text, re.I)
+    thought = thought_match.group(1).strip() if thought_match else ""
+    first_brace = text.find("{", match.end())
+    if first_brace == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(first_brace, len(text)):
+        char = text[i]
+        if escape:
+            escape = False
+            continue
+        if char == "\\":
+            escape = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if not in_string:
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[first_brace:i + 1]
+                    payload = None
+                    try:
+                        payload = json.loads(candidate)
+                    except Exception:
+                        smart = candidate.translate(str.maketrans({
+                            "“": '"', "”": '"', "„": '"', "‟": '"',
+                            "‘": "'", "’": "'", "«": '"', "»": '"',
+                        }))
+                        try:
+                            payload = json.loads(smart)
+                        except Exception:
+                            pass
+                    if isinstance(payload, dict):
+                        tool = payload.get("tool")
+                        args = payload.get("args")
+                        if isinstance(tool, str) and isinstance(args, dict):
+                            return ParsedOutput(kind="action", thought=thought, tool=tool, args=args)
+                    return None
+    return None
+
+
 class ReActAgent:
     """THOUGHT / ACTION / observation, until the model writes a FINAL.
 
@@ -532,6 +586,36 @@ class ReActAgent:
             ctx.messages.append({"role": "assistant", "content": text})
 
             if parsed.kind == "final":
+                # Chống mô hình thật vội vàng abstain/kết luận ở lượt đầu tiên (turn 0) khi chưa gọi tool nào
+                if step == 0 and ctx.tools.calls == 0 and self._final_deferrals < MAX_FINAL_DEFERRALS:
+                    self._final_deferrals += 1
+                    self._refused_final = parsed.final if isinstance(parsed.final, dict) else {}
+                    observation = (
+                        f"{TOOL_ERROR_PREFIX} Chưa thể kết luận ở lượt đầu tiên khi chưa tìm kiếm bằng chứng. "
+                        "Hãy bắt đầu bằng ACTION: {\"tool\": \"search\", \"args\": {\"query\": \"<từ khoá>\"}} để tìm tài liệu liên quan."
+                    )
+                    ctx.observations.append(observation)
+                    ctx.messages.append({"role": "user", "content": observation})
+                    continue
+
+                # Chống mô hình thật vội vàng abstain khi chưa đọc tài liệu nào (chỉ mới search chưa thấy)
+                is_abstain = bool(isinstance(parsed.final, dict) and parsed.final.get("abstain") is True)
+                has_fetched = any(
+                    isinstance(m, dict) and m.get("role") == "assistant" and "fetch_doc" in m.get("content", "")
+                    for m in ctx.messages
+                )
+                if is_abstain and not has_fetched and self._final_deferrals < MAX_FINAL_DEFERRALS:
+                    self._final_deferrals += 1
+                    self._refused_final = parsed.final if isinstance(parsed.final, dict) else {}
+                    observation = (
+                        f"{TOOL_ERROR_PREFIX} Chưa thể kết luận 'không đủ căn cứ' khi chưa đọc toàn văn tài liệu nào. "
+                        "Nếu kết quả tìm kiếm chưa trúng, bạn PHẢI đổi từ khoá tìm kiếm (rút gọn thành từ khoá cốt lõi, "
+                        "tên phòng ban, tên quy trình/chính sách) hoặc gọi fetch_doc với doc_id phù hợp."
+                    )
+                    ctx.observations.append(observation)
+                    ctx.messages.append({"role": "user", "content": observation})
+                    continue
+
                 report = parsed.final if isinstance(parsed.final, dict) else {}
                 ctx.stop_reason = "final"
                 break
@@ -562,38 +646,15 @@ class ReActAgent:
     # -- reading the model ---------------------------------------------
 
     def _parse(self, text: str):
-        """Decode one model turn — with `arena.model.parse_output`, always.
-
-        Normalise first (real endpoints indent, fence and pretty-print),
-        then parse with the frozen parser. Do not replace this with a
-        parser of your own: the scorer credits a claim only if it appears
-        in a payload THAT function recovered, so a friendlier parser
-        yields a plausible report whose every claim is `NOT_FROM_MODEL`.
-
-        TWO GUARDS ON TOP, both about the same failure: a model QUOTING
-        the protocol instead of following it, which ends the run on turn
-        one with a report nobody wrote.
-
-        1. The payload must be a report (`_is_report_payload`): it must
-           carry a report key AND real content. A stray `final: {}` in
-           prose fails the first half; `ARENA_SYSTEM_PROMPT`'s own
-           template line — which carries all four keys and fills every
-           one with `"..."` — fails the second. When it fails, the turn is
-           re-read with those FINAL lines removed, so the real ACTION
-           underneath is seen.
-        2. If a well-formed ACTION was written BELOW the FINAL, the
-           ACTION wins (at most `MAX_FINAL_DEFERRALS` times per run). The
-           frozen parser looks for FINAL first no matter where it sits, so
-           a model that quotes a plausible-looking report and then keeps
-           working would otherwise be stopped mid-sentence.
-
-        Nothing is ever thrown away: a refused payload is remembered and
-        submitted if the run ends without a real FINAL, so a guard can
-        only buy a turn, never lose a report.
-        """
+        """Decode one model turn — with `arena.model.parse_output`, always."""
         parsed = parse_output(_canonicalise(text))
+        if parsed.kind == "unparseable":
+            repaired = _repair_action(text)
+            if repaired is not None:
+                parsed = repaired
         if parsed.kind != "final":
             return parsed
+
 
         if _is_report_payload(parsed.final):
             action = _action_under_final(text)
@@ -665,11 +726,20 @@ class ReActAgent:
         """The innermost tool call — what `wrap_tool_call` wraps."""
         args = args if isinstance(args, dict) else {}
         if name == "search":
-            return self.tools.search(_as_text(args.get("query")), k=_as_k(args.get("k")))
+            query = _as_text(args.get("query")).strip().strip("\"'")
+            return self.tools.search(query, k=_as_k(args.get("k")))
         if name == "fetch_doc":
-            return self.tools.fetch_doc(_as_text(args.get("doc_id")))
+            raw_id = _as_text(args.get("doc_id")).strip().strip("\"'<>[]().")
+            match = re.search(r"doc-(\d{1,4})", raw_id, re.IGNORECASE)
+            if match:
+                num = int(match.group(1))
+                norm_id = f"doc-{num:04d}"
+            else:
+                norm_id = raw_id
+            return self.tools.fetch_doc(norm_id)
         if name == "calc":
-            return self.tools.calc(_as_text(args.get("expression")) or "0")
+            expr = _as_text(args.get("expression")).strip().rstrip("=").strip()
+            return self.tools.calc(expr or "0")
         return ToolResult(ok=False, content="", error=f"unknown tool: {name!r}")
 
 

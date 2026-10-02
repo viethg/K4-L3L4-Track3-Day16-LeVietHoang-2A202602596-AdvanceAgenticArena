@@ -59,7 +59,35 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import json
+import re
+import unicodedata
+
 from harness.middleware import Middleware
+
+_WS_RE = re.compile(r"\s+")
+
+
+def _norm(text: str) -> str:
+    """Casefolded NFC with whitespace collapsed — khớp hoàn toàn với arena.scorer._norm."""
+    if not isinstance(text, str):
+        return ""
+    return _WS_RE.sub(" ", unicodedata.normalize("NFC", text).casefold()).strip()
+
+
+def _line_supports(doc_body: str, text: str) -> bool:
+    """Kiểm tra câu trích có khớp nguyên văn một dòng của doc không (kể cả sau chuẩn hoá)."""
+    if not doc_body or not text:
+        return False
+    # 1. So khớp trực tiếp từng dòng
+    lines = doc_body.splitlines()
+    if any(text in line for line in lines):
+        return True
+    # 2. So khớp chuẩn hoá (chuẩn hoá unicode NFC và khoảng trắng)
+    norm_text = _norm(text)
+    if len(norm_text) >= 12:
+        return any(norm_text in _norm(line) for line in lines)
+    return False
 
 
 class CitationChecker(Middleware):
@@ -67,17 +95,64 @@ class CitationChecker(Middleware):
 
     name = "citation_checker"
 
+    def wrap_tool_call(self, ctx, call, name, args):
+        result = call(name, args)
+        if hasattr(ctx, "state") and isinstance(ctx.state, dict):
+            retrieved = ctx.state.setdefault("retrieved_doc_ids", set())
+            if name == "fetch_doc":
+                doc_id = args.get("doc_id") if isinstance(args, dict) else (args[0] if args else None)
+                if isinstance(doc_id, str) and doc_id:
+                    retrieved.add(doc_id)
+            elif name == "search" and result.ok and isinstance(result.content, str):
+                try:
+                    items = json.loads(result.content)
+                    if isinstance(items, list):
+                        for item in items:
+                            if isinstance(item, dict) and "doc_id" in item:
+                                retrieved.add(item["doc_id"])
+                except Exception:
+                    pass
+        return result
+
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not isinstance(report, dict) or ctx.corpus is None:
+            return report
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        observed = ctx.observed_text
+        retrieved_ids = set()
+        if hasattr(ctx, "state") and isinstance(ctx.state, dict):
+            retrieved_ids = ctx.state.get("retrieved_doc_ids", set())
+
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+
+            doc_id = claim.get("doc_id")
+            doc = ctx.corpus.get(doc_id) if doc_id else None
+            # Nếu doc hiện tại đã hỗ trợ claim, giữ nguyên
+            if doc is not None and _line_supports(doc.body, text):
+                continue
+
+            # Tra cứu trong các tài liệu agent thực sự đã truy xuất
+            for candidate in ctx.corpus.docs:
+                is_retrieved = (
+                    candidate.doc_id in retrieved_ids
+                    or candidate.body in observed
+                    or any(len(l) >= 25 and l in observed for l in candidate.body.splitlines())
+                )
+                if is_retrieved and _line_supports(candidate.body, text):
+                    claim["doc_id"] = candidate.doc_id
+                    break
+
+        report["citations"] = sorted(set(
+            c["doc_id"] for c in claims
+            if isinstance(c, dict) and "doc_id" in c and c["doc_id"]
+        ))
+        return report
+
